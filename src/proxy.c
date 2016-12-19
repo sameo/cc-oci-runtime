@@ -47,6 +47,7 @@ struct watcher_proxy_data
 	 * otherwise it WILL wait
 	 */
 	int         *oob_fd;
+	gboolean    oob_fd_found;
 };
 
 /** Format of a proxy message */
@@ -237,8 +238,7 @@ cc_proxy_msg_read (GIOChannel *source, GIOCondition condition,
 {
 	struct proxy_msg p_msg = { 0 };
 	gchar iov_buffer[LINE_MAX] = { 0 };
-	ssize_t bytes_read;
-	gboolean fd_read = false;
+	ssize_t bytes_read, total_bytes_read = 0;
 	struct msghdr msg = { 0 };
 	struct cmsghdr *cmsg = NULL;
 	struct iovec io = { .iov_base = iov_buffer,
@@ -264,11 +264,13 @@ cc_proxy_msg_read (GIOChannel *source, GIOCondition condition,
 	}
 
 	if (bytes_read == 0) {
-		g_critical("failed to read lenght");
+		g_critical("failed to read length");
 		return false;
 	}
 
-	if (proxy_data->oob_fd) {
+	total_bytes_read += bytes_read;
+
+	if (proxy_data->oob_fd && !proxy_data->oob_fd_found) {
 		/* check if oob data was received */
 		cmsg = CMSG_FIRSTHDR(&msg);
 		if (cmsg) {
@@ -277,14 +279,14 @@ cc_proxy_msg_read (GIOChannel *source, GIOCondition condition,
 				*proxy_data->oob_fd = *((int*) data);
 				g_message("oob fd read from proxy socket %d",
 					*proxy_data->oob_fd);
-				fd_read = true;
 			}
 		}
 	}
 
 	/* only out-of-band data was received */
 	if (bytes_read < sizeof (buf_len) || iov_buffer[0] == 'F' ) {
-		goto out1;
+		proxy_data->oob_fd_found = true;
+		return true;
 	}
 
 	/* cc-proxy sends a fd as out-of-band data
@@ -302,45 +304,31 @@ cc_proxy_msg_read (GIOChannel *source, GIOCondition condition,
 
 	/* all message was read */
 	if (bytes_read >= p_msg.length+data_offset) {
-		goto out2;
+		goto out;
 	}
 
 	/* read missing bytes */
 	while(true) {
 		bytes_read = recvmsg(proxy_data->socket_fd, &msg, 0);
 		if (bytes_read < 0) {
+			if ((errno == EAGAIN) && (total_bytes_read < p_msg.length + data_offset)) {
+				continue;
+			}
+
 			/* no more data to read */
 			break;
 		}
-		if (! proxy_data->oob_fd) {
-			/* this message has not out-of-band data */
-			continue;
-		}
 
-		/* check if oob data was received */
-		cmsg = CMSG_FIRSTHDR(&msg);
-		if (cmsg) {
-			data = CMSG_DATA(cmsg);
-			if (data) {
-				*proxy_data->oob_fd = *((int*) data);
-				g_message("oob fd read from proxy socket %d",
-					*proxy_data->oob_fd);
-				fd_read = true;
-			}
-		}
 		g_string_append_len(proxy_data->msg_received,
 			iov_buffer, bytes_read);
+
+		total_bytes_read += bytes_read;
 	}
 
-out2:
+out:
 	if (proxy_data->msg_received->len > 0) {
 		g_debug("message read from proxy socket: %s",
 			proxy_data->msg_received->str);
-	}
-out1:
-	if (proxy_data->oob_fd && !fd_read) {
-		g_debug("waiting for oob fd");
-		return true;
 	}
 
 	g_main_loop_quit (proxy_data->loop);
@@ -567,6 +555,7 @@ cc_proxy_run_cmd(struct cc_proxy *proxy,
 	g_io_channel_set_encoding (channel, NULL, NULL);
 
 	proxy_data.msg_received = msg_received;
+	proxy_data.oob_fd_found = false;
 
 	/* add a watcher for proxy's socket stdin */
 	g_io_add_watch(channel, G_IO_OUT | G_IO_HUP,

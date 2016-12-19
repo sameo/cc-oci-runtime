@@ -64,6 +64,37 @@ func (client *Client) sendPayload(id string, payload interface{}) (*Response, er
 	return &resp, nil
 }
 
+func (client *Client) sendPayloadGetFd(id string, payload interface{}) (*Response, *os.File, error) {
+	var err error
+
+	req := Request{}
+	req.ID = id
+	if payload != nil {
+		if req.Data, err = json.Marshal(payload); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	if err := WriteMessage(client.conn, &req); err != nil {
+		return nil, nil, err
+	}
+
+	// I/O fd
+	newFd, err := ReadFd(client.conn)
+	if err != nil {
+		return nil, nil, errors.New("sendPayloadGetFd: couldn't read fd")
+	}
+
+	ioFile := os.NewFile(uintptr(newFd), "")
+
+	resp := Response{}
+	if err := ReadMessage(client.conn, &resp); err != nil {
+		return nil, nil, err
+	}
+
+	return &resp, ioFile, nil
+}
+
 func errorFromResponse(resp *Response) error {
 	// We should always have an error with the response, but better safe
 	// than sorry.
@@ -114,7 +145,7 @@ func (client *Client) AllocateIo(nStreams int) (ioBase uint64, ioFile *os.File, 
 		NStreams: nStreams,
 	}
 
-	resp, err := client.sendPayload("allocateIO", &allocate)
+	resp, ioFile, err := client.sendPayloadGetFd("allocateIO", &allocate)
 	if err != nil {
 		return
 	}
@@ -130,14 +161,6 @@ func (client *Client) AllocateIo(nStreams int) (ioBase uint64, ioFile *os.File, 
 	}
 
 	ioBase = (uint64)(val.(float64))
-
-	// I/O fd
-	newFd, err := ReadFd(client.conn)
-	if err != nil {
-		return 0, nil, errors.New("allocateio: couldn't read fd")
-	}
-
-	ioFile = os.NewFile(uintptr(newFd), "")
 
 	return
 }
